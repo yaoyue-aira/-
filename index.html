@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Monet's Interactive Garden</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+        #video-input { display: none; } /* 隐藏原始视频流 */
+
+        /* 错误提示层 */
+        #error-overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(20, 0, 0, 0.95); z-index: 9999;
+            display: none; justify-content: center; align-items: center; flex-direction: column;
+            color: #ff6b6b; text-align: center; padding: 20px;
+        }
+        #error-overlay h1 { font-size: 2rem; margin-bottom: 10px; }
+        #error-overlay p { font-size: 1.2rem; color: #ddd; line-height: 1.6; }
+        .code-box { background: #333; padding: 5px 10px; border-radius: 4px; font-family: monospace; color: #fff; }
+
+        /* 加载动画 */
+        #loader {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: #080808; z-index: 500; display: flex; flex-direction: column;
+            justify-content: center; align-items: center; color: white;
+            transition: opacity 0.5s;
+        }
+        .spinner {
+            width: 40px; height: 40px; border: 4px solid #333;
+            border-top: 4px solid #9CB071; border-radius: 50%;
+            animation: spin 1s linear infinite; margin-bottom: 20px;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
+        /* UI */
+        #ui-layer { position: absolute; z-index: 10; pointer-events: none; width: 100%; height: 100%; }
+        #fs-btn {
+            position: absolute; bottom: 30px; right: 30px; pointer-events: auto;
+            background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.3);
+            color: #fff; padding: 12px 20px; border-radius: 8px; cursor: pointer;
+            backdrop-filter: blur(10px); transition: 0.3s;
+        }
+        #fs-btn:hover { background: rgba(255,255,255,0.2); }
+        #instruction {
+            position: absolute; bottom: 80px; width: 100%; text-align: center;
+            color: rgba(255,255,255,0.5); font-size: 14px; text-shadow: 0 2px 4px rgba(0,0,0,0.8);
+        }
+    </style>
+    
+    <!-- 引入 MediaPipe 核心 (全局模式，更稳定) -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <!-- 错误提示（如果用 file:// 打开会显示） -->
+    <div id="error-overlay">
+        <h1>无法启动 (Protocol Error)</h1>
+        <p>你正在直接双击文件打开 (file://)，浏览器为了安全禁止了摄像头。</p>
+        <p>请使用 <strong>Live Server</strong> 或 <strong>Localhost</strong> 打开。</p>
+        <p style="font-size: 0.9rem; margin-top: 20px; color: #888;">
+            地址栏必须是 <span class="code-box">http://</span> 或 <span class="code-box">https://</span> 开头。<br>
+            而非 <span class="code-box">file:///</span>
+        </p>
+    </div>
+
+    <div id="loader">
+        <div class="spinner"></div>
+        <div id="status-text">正在连接视觉引擎...</div>
+    </div>
+
+    <div id="ui-layer">
+        <div id="instruction">伸出食指 · 指向屏幕 · 唤醒花园</div>
+        <button id="fs-btn">⛶ 进入全屏</button>
+    </div>
+
+    <video id="video-input" playsinline></video>
+    <div id="canvas-container"></div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import GUI from 'lil-gui';
+
+        // --- 1. 协议检测 (Protocol Check) ---
+        if (window.location.protocol === 'file:') {
+            document.getElementById('error-overlay').style.display = 'flex';
+            document.getElementById('loader').style.display = 'none';
+            throw new Error("File Protocol Detected");
+        }
+
+        // --- 2. 配置参数 ---
+        const config = {
+            count: 3000,
+            size: 0.15,
+            monetMode: true,
+            color: '#ffb7c5',
+            fingerInfluence: 0.0, // 0~1
+            fingerX: 0.5,
+            fingerY: 0.5
+        };
+
+        const MONET_COLORS = [
+            '#6B8E23', '#4682B4', '#FFB7C5', '#E6E6FA', '#008080', '#F0E68C', '#D8BFD8'
+        ].map(c => new THREE.Color(c));
+
+        // --- 3. Three.js 初始化 ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x050505, 0.02);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 100);
+        camera.position.z = 5;
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.autoRotate = true;
+        controls.autoRotateSpeed = 0.5;
+
+        // --- 4. 粒子系统 ---
+        let particles;
+        const particleTexture = (() => {
+            const c = document.createElement('canvas'); c.width=64; c.height=64;
+            const ctx = c.getContext('2d');
+            const g = ctx.createRadialGradient(32,32,0,32,32,32);
+            g.addColorStop(0, 'rgba(255,255,255,1)');
+            g.addColorStop(0.4, 'rgba(255,255,255,0.4)');
+            g.addColorStop(1, 'rgba(255,255,255,0)');
+            ctx.fillStyle = g; ctx.fillRect(0,0,64,64);
+            return new THREE.Texture(c);
+        })();
+        particleTexture.needsUpdate = true;
+
+        function initParticles() {
+            if(particles) scene.remove(particles);
+            const geo = new THREE.BufferGeometry();
+            const pos = [], cols = [], initPos = [], speeds = [];
+            const tempColor = new THREE.Color();
+
+            for(let i=0; i<config.count; i++){
+                const r = 2 + Math.random() * 2;
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+                
+                const x = r * Math.sin(phi) * Math.cos(theta);
+                const y = r * Math.sin(phi) * Math.sin(theta);
+                const z = r * Math.cos(phi);
+                
+                pos.push(x,y,z); initPos.push(x,y,z); speeds.push(Math.random());
+
+                if(config.monetMode) {
+                    tempColor.copy(MONET_COLORS[Math.floor(Math.random() * MONET_COLORS.length)]);
+                    tempColor.r += (Math.random()-0.5)*0.1;
+                } else {
+                    tempColor.set(config.color);
+                }
+                cols.push(tempColor.r, tempColor.g, tempColor.b);
+            }
+
+            geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+            geo.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
+            geo.setAttribute('initialPos', new THREE.Float32BufferAttribute(initPos, 3));
+            geo.setAttribute('speed', new THREE.Float32BufferAttribute(speeds, 1));
+
+            const mat = new THREE.PointsMaterial({
+                size: config.size, vertexColors: true, map: particleTexture,
+                blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, opacity: 0.8
+            });
+
+            particles = new THREE.Points(geo, mat);
+            scene.add(particles);
+        }
+        initParticles();
+
+        // --- 5. MediaPipe 手势识别 ---
+        const videoElement = document.getElementById('video-input');
+        
+        // 注意：这里使用全局 window.Hands，因为是通过 script 标签引入的
+        const hands = new window.Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+        }});
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        hands.onResults(results => {
+            document.getElementById('loader').style.opacity = '0';
+            setTimeout(() => document.getElementById('loader').style.display = 'none', 500);
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const lm = results.multiHandLandmarks[0];
+                const wrist = lm[0];
+                const index = lm[8]; // 食指
+
+                // 计算强度 (食指远离手腕的距离 + 手掌在画面中的大小)
+                const dist = Math.sqrt(Math.pow(index.x-wrist.x, 2) + Math.pow(index.y-wrist.y, 2));
+                const targetInfluence = Math.min(Math.max((dist - 0.1) * 4, 0), 1);
+                
+                config.fingerInfluence += (targetInfluence - config.fingerInfluence) * 0.1;
+                config.fingerX = 1 - index.x; // 镜像
+                config.fingerY = index.y;
+            } else {
+                config.fingerInfluence *= 0.95; // 衰减
+            }
+        });
+
+        // 启动摄像头
+        const cameraUtils = new window.Camera(videoElement, {
+            onFrame: async () => { await hands.send({image: videoElement}); },
+            width: 640, height: 480
+        });
+        
+        cameraUtils.start().catch(err => {
+            console.error(err);
+            document.getElementById('status-text').innerText = "摄像头启动失败，请检查 HTTPS/Localhost";
+        });
+
+        // --- 6. UI 面板 ---
+        const gui = new GUI({ title: '莫奈花园' });
+        gui.add(config, 'monetMode').name('印象派模式').onChange(initParticles);
+        gui.addColor(config, 'color').name('自定义颜色').onChange(() => {
+            config.monetMode = false; initParticles();
+        });
+        gui.add(config, 'fingerInfluence', 0, 1).name('手势强度').listen();
+
+        // --- 7. 动画循环 ---
+        const clock = new THREE.Clock();
+        function animate() {
+            requestAnimationFrame(animate);
+            const time = clock.getElapsedTime();
+            controls.update();
+
+            if(particles) {
+                const positions = particles.geometry.attributes.position.array;
+                const initPos = particles.geometry.attributes.initialPos.array;
+                const speeds = particles.geometry.attributes.speed.array;
+                
+                // 交互逻辑
+                const expand = 1.0 + (config.fingerInfluence * 2.0); // 放大
+                const noiseAmp = 0.05 + (config.fingerInfluence * 0.2); // 扰动增强
+                
+                // 旋转逻辑 (跟随手指)
+                const tx = (config.fingerY - 0.5) * 0.5;
+                const ty = (config.fingerX - 0.5) * 0.5;
+                particles.rotation.x += (tx - particles.rotation.x) * 0.05;
+                particles.rotation.y += (ty - particles.rotation.y + 0.001) * 0.05;
+
+                for(let i=0; i<config.count; i++){
+                    const i3 = i*3;
+                    const sp = speeds[i];
+                    
+                    // 呼吸效果
+                    const dx = Math.sin(time*sp + initPos[i3]) * noiseAmp;
+                    const dy = Math.cos(time*sp + initPos[i3+1]) * noiseAmp;
+                    const dz = Math.sin(time*sp + initPos[i3+2]) * noiseAmp;
+
+                    positions[i3] = initPos[i3] * expand + dx;
+                    positions[i3+1] = initPos[i3+1] * expand + dy;
+                    positions[i3+2] = initPos[i3+2] * expand + dz;
+                }
+                particles.geometry.attributes.position.needsUpdate = true;
+            }
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        // 全屏
+        document.getElementById('fs-btn').onclick = () => {
+            if(!document.fullscreenElement) document.documentElement.requestFullscreen();
+            else document.exitFullscreen();
+        };
+        
+        window.onresize = () => {
+            camera.aspect = window.innerWidth/window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        };
+    </script>
+</body>
+</html>
